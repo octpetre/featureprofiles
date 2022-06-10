@@ -1,9 +1,11 @@
-package helpers
+package otgutils
 
 import (
-	"encoding/json"
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"runtime"
@@ -14,7 +16,6 @@ import (
 	"github.com/open-traffic-generator/snappi/gosnappi"
 	"github.com/openconfig/ondatra"
 	"google.golang.org/protobuf/encoding/protojson"
-	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // using protojson to marshal will emit property names with lowerCamelCase
@@ -29,82 +30,24 @@ type WaitForOpts struct {
 }
 
 type MetricsTableOpts struct {
-	ClearPrevious bool
-	FlowMetrics   gosnappi.MetricsResponseFlowMetricIter
-	PortMetrics   gosnappi.MetricsResponsePortMetricIter
-	Bgpv4Metrics  gosnappi.MetricsResponseBgpv4MetricIter
-	Bgpv6Metrics  gosnappi.MetricsResponseBgpv6MetricIter
-	IsisMetrics   gosnappi.MetricsResponseIsisMetricIter
+	ClearPrevious  bool
+	FlowMetrics    gosnappi.MetricsResponseFlowMetricIter
+	PortMetrics    gosnappi.MetricsResponsePortMetricIter
+	AllPortMetrics gosnappi.MetricsResponsePortMetricIter
+	Bgpv4Metrics   gosnappi.MetricsResponseBgpv4MetricIter
+	Bgpv6Metrics   gosnappi.MetricsResponseBgpv6MetricIter
+	IsisMetrics    gosnappi.MetricsResponseIsisMetricIter
+}
+
+type StatesTableOpts struct {
+	ClearPrevious       bool
+	Ipv4NeighborsStates gosnappi.StatesResponseNeighborsv4StateIter
+	Ipv6NeighborsStates gosnappi.StatesResponseNeighborsv6StateIter
 }
 
 func Timer(start time.Time, name string) {
 	elapsed := time.Since(start)
 	log.Printf("%s took %d ms", name, elapsed.Milliseconds())
-}
-
-func LogWarnings(warnings []string) {
-	for _, w := range warnings {
-		log.Printf("WARNING: %v", w)
-	}
-}
-
-func LogErrors(errors *[]string) error {
-	if errors == nil {
-		return fmt.Errorf("")
-	}
-	for _, e := range *errors {
-		log.Printf("ERROR: %v", e)
-	}
-
-	return fmt.Errorf("%v", errors)
-}
-
-func PrettyStructString(v interface{}) string {
-	var bytes []byte
-	var err error
-
-	switch v := v.(type) {
-	case protoreflect.ProtoMessage:
-		bytes, err = prettyProtoMarshaller.Marshal(v)
-		if err != nil {
-			log.Println(err)
-			return ""
-		}
-	default:
-		bytes, err = json.MarshalIndent(v, "", "  ")
-		if err != nil {
-			log.Println(err)
-			return ""
-		}
-	}
-
-	return string(bytes)
-}
-
-func ProtoToJsonStruct(in protoreflect.ProtoMessage, out interface{}) error {
-	log.Println("Marshalling from proto to json struct ...")
-
-	bytes, err := protoMarshaller.Marshal(in)
-	if err != nil {
-		return fmt.Errorf("could not marshal from proto to json: %v", err)
-	}
-	if err := json.Unmarshal(bytes, out); err != nil {
-		return fmt.Errorf("could not unmarshal from json to struct: %v", err)
-	}
-	return nil
-}
-
-func JsonStructToProto(in interface{}, out protoreflect.ProtoMessage) error {
-	log.Println("Marshalling from struct to json ... ")
-
-	bytes, err := json.Marshal(in)
-	if err != nil {
-		return fmt.Errorf("could not marshal from struct to json: %v", err)
-	}
-	if err := protojson.Unmarshal(bytes, out); err != nil {
-		return fmt.Errorf("could not unmarshal from json to proto: %v", err)
-	}
-	return nil
 }
 
 func WaitFor(t *testing.T, fn func() (bool, error), opts *WaitForOpts) error {
@@ -119,7 +62,7 @@ func WaitFor(t *testing.T, fn func() (bool, error), opts *WaitForOpts) error {
 		opts.Interval = 500 * time.Millisecond
 	}
 	if opts.Timeout == 0 {
-		opts.Timeout = 30 * time.Second
+		opts.Timeout = 120 * time.Second
 	}
 
 	start := time.Now()
@@ -361,6 +304,32 @@ func PrintMetricsTable(opts *MetricsTableOpts) {
 		out += border + "\n\n"
 	}
 
+	if opts.AllPortMetrics != nil {
+		border := strings.Repeat("-", 15*8-10)
+		out += "\nPort Metrics\n" + border + "\n"
+		out += fmt.Sprintf(
+			"%-15s%-15s%-15s%-15s%-15s%-15s%-15s%-15s\n",
+			"Name", "Frames Tx", "Frames Rx", "Bytes Tx", "Bytes Rx", "FPS Tx", "FPS Rx", "Link",
+		)
+		for _, m := range opts.AllPortMetrics.Items() {
+			if m != nil {
+				name := m.Name()
+				txFrames := m.FramesTx()
+				rxFrames := m.FramesRx()
+				txBytes := m.BytesTx()
+				rxBytes := m.BytesRx()
+				txRate := m.FramesTxRate()
+				rxRate := m.FramesRxRate()
+				link := m.Link()
+				out += fmt.Sprintf(
+					"%-15v%-15v%-15v%-15v%-15v%-15v%-15v%-15v\n",
+					name, txFrames, rxFrames, txBytes, rxBytes, txRate, rxRate, link,
+				)
+			}
+		}
+		out += border + "\n\n"
+	}
+
 	if opts.FlowMetrics != nil {
 		border := strings.Repeat("-", 32*3+10)
 		out += "\nFlow Metrics\n" + border + "\n"
@@ -384,32 +353,10 @@ func PrintMetricsTable(opts *MetricsTableOpts) {
 	log.Println(out)
 }
 
-func GetCapturePorts(c gosnappi.Config) []string {
-	capturePorts := []string{}
-	if c == nil {
-		return capturePorts
-	}
-
-	for _, capture := range c.Captures().Items() {
-		capturePorts = append(capturePorts, capture.PortNames()...)
-	}
-	return capturePorts
-}
-
-func CleanupTest(t *testing.T, ate *ondatra.ATEDevice, otg *ondatra.OTG, stopProtocols bool, stopTraffic bool) {
-	if stopTraffic {
-		otg.StopTraffic(t)
-	}
-	if stopProtocols {
-		otg.StopProtocols(t)
-	}
-	otg.PushConfig(t, ate, otg.NewConfig())
-}
-
-func (client *GnmiClient) WatchFlowMetrics(opts *WaitForOpts) error {
+func WatchFlowMetrics(t *testing.T, otg *ondatra.OTG, c gosnappi.Config, opts *WaitForOpts) error {
 	start := time.Now()
 	for {
-		fMetrics, err := client.GetFlowMetrics([]string{})
+		fMetrics, err := GetFlowMetrics(t, otg, c)
 		if err != nil {
 			return err
 		}
@@ -423,4 +370,34 @@ func (client *GnmiClient) WatchFlowMetrics(opts *WaitForOpts) error {
 		}
 		time.Sleep(opts.Interval)
 	}
+}
+
+func expectedElementsPresent(expected, actual []string) bool {
+	exists := make(map[string]bool)
+	for _, value := range actual {
+		exists[value] = true
+	}
+	for _, value := range expected {
+		if !exists[value] {
+			return false
+		}
+	}
+	return true
+}
+
+func IncrementedMac(mac string, i int) (string, error) {
+	// Uses an mac string and increments it by the given i
+	macAddr, err := net.ParseMAC(mac)
+	if err != nil {
+		return "", err
+	}
+	convMac := binary.BigEndian.Uint64(append([]byte{0, 0}, macAddr...))
+	convMac = convMac + uint64(i)
+	buf := new(bytes.Buffer)
+	err = binary.Write(buf, binary.BigEndian, convMac)
+	if err != nil {
+		return "", err
+	}
+	newMac := net.HardwareAddr(buf.Bytes()[2:8])
+	return newMac.String(), nil
 }

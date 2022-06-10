@@ -22,9 +22,9 @@ import (
 	"time"
 
 	"github.com/open-traffic-generator/snappi/gosnappi"
-	"github.com/openconfig/featureprofiles/helpers"
 	"github.com/openconfig/featureprofiles/internal/attrs"
 	"github.com/openconfig/featureprofiles/internal/fptest"
+	"github.com/openconfig/featureprofiles/internal/otgutils"
 	"github.com/openconfig/ondatra"
 	"github.com/openconfig/ondatra/telemetry"
 	"github.com/openconfig/ygot/ygot"
@@ -335,9 +335,9 @@ func verifyPolicyTelemetry(t *testing.T, dut *ondatra.DUTDevice, policy string) 
 
 // configureOTG configures the interfaces and BGP protocols on an OTG, including advertising some
 // (faked) networks over BGP.
-func configureOTG(t *testing.T, ate *ondatra.ATEDevice, otg *ondatra.OTG, expectedRoutes int32) (gosnappi.Config, helpers.ExpectedState) {
+func configureOTG(t *testing.T, otg *ondatra.OTG, expectedRoutes int32) (gosnappi.Config, otgutils.ExpectedState) {
 
-	config := otg.NewConfig()
+	config := otg.NewConfig(t)
 	srcPort := config.Ports().Add().SetName("port1")
 	dstPort := config.Ports().Add().SetName("port2")
 
@@ -462,36 +462,37 @@ func configureOTG(t *testing.T, ate *ondatra.ATEDevice, otg *ondatra.OTG, expect
 	v6.Src().SetValue(srcIpv6.Address())
 	v6.Dst().Increment().SetStart(strings.Split(advertisedRoutesv6CIDR, "/")[0]).SetCount(routeCount)
 
-	expected := helpers.ExpectedState{
-		Bgp4: map[string]helpers.ExpectedBgpMetrics{
+	expected := otgutils.ExpectedState{
+		Bgp4: map[string]otgutils.ExpectedBgpMetrics{
 			srcBgp4Peer.Name(): {Advertised: 0, Received: expectedRoutes},
 			dstBgp4Peer.Name(): {Advertised: routeCount, Received: 0},
 		},
-		Bgp6: map[string]helpers.ExpectedBgpMetrics{
+		Bgp6: map[string]otgutils.ExpectedBgpMetrics{
 			srcBgp6Peer.Name(): {Advertised: 0, Received: expectedRoutes},
 			dstBgp6Peer.Name(): {Advertised: routeCount, Received: 0},
 		},
-		Flow: map[string]helpers.ExpectedFlowMetrics{
+		Flow: map[string]otgutils.ExpectedFlowMetrics{
 			flowipv4.Name(): {FramesRx: 0, FramesRxRate: 0},
 			flowipv6.Name(): {FramesRx: 0, FramesRxRate: 0},
 		},
 	}
 
 	t.Logf("Pushing config to ATE and starting protocols...")
-	otg.PushConfig(t, ate, config)
+	otg.PushConfig(t, config)
 	otg.StartProtocols(t)
 	return config, expected
 }
 
 // verifyTraffic confirms that every traffic flow has the expected amount of loss (0% or 100%
 // depending on wantLoss, +- 2%)
-func verifyTraffic(t *testing.T, gnmiClient *helpers.GnmiClient, wantLoss bool) {
-	fMetrics, err := gnmiClient.GetFlowMetrics([]string{})
+func verifyTraffic(t *testing.T, ate *ondatra.ATEDevice, c gosnappi.Config, wantLoss bool) {
+	otg := ate.OTG()
+	fMetrics, err := otgutils.GetFlowMetrics(t, otg, c)
 	if err != nil {
 		t.Fatal("Error while getting the flow metrics")
 	}
 
-	helpers.PrintMetricsTable(&helpers.MetricsTableOpts{
+	otgutils.PrintMetricsTable(&otgutils.MetricsTableOpts{
 		ClearPrevious: false,
 		FlowMetrics:   fMetrics,
 	})
@@ -518,36 +519,15 @@ func verifyTraffic(t *testing.T, gnmiClient *helpers.GnmiClient, wantLoss bool) 
 	}
 }
 
-func sendTraffic(t *testing.T, otg *ondatra.OTG, gnmiClient *helpers.GnmiClient) {
+func sendTraffic(t *testing.T, otg *ondatra.OTG, c gosnappi.Config) {
 	t.Logf("Starting traffic")
 	otg.StartTraffic(t)
-	err := gnmiClient.WatchFlowMetrics(&helpers.WaitForOpts{Interval: 2 * time.Second, Timeout: trafficDuration})
+	err := otgutils.WatchFlowMetrics(t, otg, c, &otgutils.WaitForOpts{Interval: 2 * time.Second, Timeout: trafficDuration})
 	if err != nil {
 		log.Println(err)
 	}
 	t.Logf("Stop traffic")
 	otg.StopTraffic(t)
-}
-
-func verifyOtgBgpDown(t *testing.T, gnmiClient helpers.GnmiClient) {
-	exit := true
-	for exit {
-		dMetrics, err := gnmiClient.GetBgpv4Metrics([]string{})
-		if err != nil {
-			t.Errorf("Failed to retrieve OTG BGP stats")
-			exit = false
-		}
-		helpers.PrintMetricsTable(&helpers.MetricsTableOpts{
-			ClearPrevious: false,
-			Bgpv4Metrics:  dMetrics,
-		})
-		for _, d := range dMetrics.Items() {
-			if d.SessionState() != gosnappi.Bgpv4MetricSessionState.UP {
-				exit = false
-			}
-		}
-		time.Sleep(1 * time.Second)
-	}
 }
 
 type bgpNeighbor struct {
@@ -579,8 +559,8 @@ func TestEstablish(t *testing.T) {
 	t.Logf("Start ATE Config")
 	ate := ondatra.ATE(t, "ate")
 
-	otg := ate.OTG(t)
-	otgConfig, otgExpected := configureOTG(t, ate, otg, routeCount)
+	otg := ate.OTG()
+	otgConfig, otgExpected := configureOTG(t, otg, routeCount)
 	// Verify Port Status
 	t.Logf("Verifying port status")
 	verifyPortsUp(t, dut.Device)
@@ -589,16 +569,12 @@ func TestEstablish(t *testing.T) {
 	verifyBgpTelemetry(t, dut)
 
 	t.Logf("Check BGP sessions on OTG")
-	gnmiClient, err := helpers.NewGnmiClient(otg.NewGnmiQuery(t), otgConfig)
-	if err != nil {
-		t.Fatal(err)
-	}
-	helpers.WaitFor(t, func() (bool, error) { return gnmiClient.AllBgp4SessionUp(otgExpected) }, nil)
-	helpers.WaitFor(t, func() (bool, error) { return gnmiClient.AllBgp6SessionUp(otgExpected) }, nil)
+	otgutils.WaitFor(t, func() (bool, error) { return otgutils.AllBgp4SessionUp(t, otg, otgConfig, otgExpected) }, &otgutils.WaitForOpts{Interval: 1 * time.Second, Timeout: 30 * time.Second, Condition: "All BGP4 sessions up"})
+	otgutils.WaitFor(t, func() (bool, error) { return otgutils.AllBgp6SessionUp(t, otg, otgConfig, otgExpected) }, &otgutils.WaitForOpts{Interval: 1 * time.Second, Timeout: 30 * time.Second, Condition: "All BGP6 sessions up"})
 
 	// Starting ATE Traffic and verify Traffic Flows and packet loss
-	sendTraffic(t, otg, gnmiClient)
-	verifyTraffic(t, gnmiClient, false)
+	sendTraffic(t, otg, otgConfig)
+	verifyTraffic(t, ate, otgConfig, false)
 	verifyPrefixesTelemetry(t, dut, routeCount, routeCount, 0)
 	verifyPrefixesTelemetryV6(t, dut, routeCount, routeCount, 0)
 
@@ -608,12 +584,10 @@ func TestEstablish(t *testing.T) {
 		dutConfPath.Replace(t, bgpCreateNbr(dutAS, badAS, defaultPolicy))
 
 		// Resend traffic
-		// A pause is needed for DUT to completely withdraw routes
-		// time.Sleep(5 * time.Second)
-		verifyOtgBgpDown(t, *gnmiClient)
-		sendTraffic(t, otg, gnmiClient)
-		verifyTraffic(t, gnmiClient, true)
-		// gnmiClient.Close()
+		otgutils.WaitFor(t, func() (bool, error) { return otgutils.AllBgp4SessionDown(t, otg, otgConfig) }, &otgutils.WaitForOpts{Interval: 1 * time.Second, Timeout: 10 * time.Second, Condition: "All BGP4 sessions down"})
+		otgutils.WaitFor(t, func() (bool, error) { return otgutils.AllBgp6SessionDown(t, otg, otgConfig) }, &otgutils.WaitForOpts{Interval: 1 * time.Second, Timeout: 10 * time.Second, Condition: "All BGP6 sessions down"})
+		sendTraffic(t, otg, otgConfig)
+		verifyTraffic(t, ate, otgConfig, true)
 	})
 }
 
@@ -674,28 +648,20 @@ func TestBGPPolicy(t *testing.T) {
 			dut.Config().RoutingPolicy().Replace(t, rpl)
 			bgp := bgpCreateNbr(dutAS, ateAS, tc.policy)
 			// Configure ATE to setup traffic.
-			otg := ate.OTG(t)
-			otgConfig, otgExpected := configureOTG(t, ate, otg, int32(tc.installed))
+			otg := ate.OTG()
+			otgConfig, otgExpected := configureOTG(t, otg, int32(tc.installed))
 			dut.Config().NetworkInstance("default").Protocol(telemetry.PolicyTypes_INSTALL_PROTOCOL_TYPE_BGP, "BGP").Bgp().Replace(t, bgp)
 			// Send and verify traffic.
-			gnmiClient, err := helpers.NewGnmiClient(otg.NewGnmiQuery(t), otgConfig)
-			if err != nil {
-				t.Fatal(err)
-			}
-			helpers.WaitFor(t, func() (bool, error) { return gnmiClient.AllBgp4SessionUp(otgExpected) }, nil)
-			helpers.WaitFor(t, func() (bool, error) { return gnmiClient.AllBgp6SessionUp(otgExpected) }, nil)
-			sendTraffic(t, otg, gnmiClient)
-			verifyTraffic(t, gnmiClient, tc.wantLoss)
-			gnmiClient.Close()
+
+			otgutils.WaitFor(t, func() (bool, error) { return otgutils.AllBgp4SessionUp(t, otg, otgConfig, otgExpected) }, &otgutils.WaitForOpts{Interval: 1 * time.Second, Timeout: 30 * time.Second, Condition: "All BGP4 sessions up"})
+			otgutils.WaitFor(t, func() (bool, error) { return otgutils.AllBgp6SessionUp(t, otg, otgConfig, otgExpected) }, &otgutils.WaitForOpts{Interval: 1 * time.Second, Timeout: 30 * time.Second, Condition: "All BGP6 sessions up"})
+			sendTraffic(t, otg, otgConfig)
+			verifyTraffic(t, ate, otgConfig, tc.wantLoss)
+
 			// Verify traffic and telemetry.
 			verifyPrefixesTelemetry(t, dut, tc.installed, tc.received, tc.sent)
 			verifyPrefixesTelemetryV6(t, dut, tc.installed, tc.received, tc.sent)
 			verifyPolicyTelemetry(t, dut, tc.policy)
 		})
 	}
-}
-
-func TestUnsetDut(t *testing.T) {
-	t.Logf("Start Unsetting DUT Config")
-	helpers.ConfigDUTs(map[string]string{"arista": "unset_dut.txt"})
 }
